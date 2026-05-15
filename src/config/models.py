@@ -53,6 +53,34 @@ class TeCoDConfig(BaseModel):
     vectorsearch_top_k: int = Field(description="Top K results for vector search")
     sql_key: str = Field(description="Key for data SQL queries")
     dialect: str = Field(description="Dialect of SQL")
+    use_codes_context: bool = Field(
+        default=False,
+        description="Build per-query CodeS-style schema/value context for prompts.",
+    )
+    sic_path: str | None = Field(
+        default=None,
+        description="Optional CodeS schema item classifier checkpoint path.",
+    )
+    schema_top_k_tables: int = Field(
+        default=5,
+        description="Number of tables retained by CodeS schema filtering.",
+    )
+    schema_top_k_columns: int = Field(
+        default=5,
+        description="Number of columns retained per table by CodeS schema filtering.",
+    )
+    value_retrieval: bool = Field(
+        default=True,
+        description="Retrieve matched database values for the per-query prompt.",
+    )
+    include_evidence: bool = Field(
+        default=True,
+        description="Append BIRD evidence text to the prompt question when available.",
+    )
+    skip_nli: bool = Field(
+        default=False,
+        description="Skip loading the NLI/reranker model when template selection is not used.",
+    )
 
     @property
     def is_api_model(self) -> bool:

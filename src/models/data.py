@@ -24,6 +24,7 @@ class GenerationRequest(BaseModel):
     content_sequence: str | None = Field(
         default=None, description="Content serialization format"
     )
+    evidence: str | None = Field(default=None, description="Optional BIRD evidence text")
     zs_prompt: str | None = Field(default=None, description="Zero-shot prompt")
     use_oracle: bool = Field(default=False, description="Whether to use oracle template")
     gold_sql: str | None = Field(default=None, description="Gold SQL")

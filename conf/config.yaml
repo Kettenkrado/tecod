@@ -60,6 +60,13 @@ tecod:
   nli_top_k: 30                 # Top-K for NLI processing
   sql_key: SQL
   dialect: sqlite
+  use_codes_context: ${oc.env:TECOD_USE_CODES_CONTEXT,false}
+  sic_path: ${oc.env:TECOD_SIC_PATH,""}
+  schema_top_k_tables: ${oc.env:TECOD_SCHEMA_TOP_K_TABLES,5}
+  schema_top_k_columns: ${oc.env:TECOD_SCHEMA_TOP_K_COLUMNS,5}
+  value_retrieval: ${oc.env:TECOD_VALUE_RETRIEVAL,true}
+  include_evidence: ${oc.env:TECOD_INCLUDE_EVIDENCE,true}
+  skip_nli: ${oc.env:TECOD_SKIP_NLI,false}
 
 # Logging Configuration
 logging:

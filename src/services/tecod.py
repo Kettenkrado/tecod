@@ -100,6 +100,7 @@ class TeCoDService(Service):
         self._nli = None
         self._examples_df: pd.DataFrame | None = None
         self._schema_prompt: str | None = None
+        self._codes_context_builder = None
 
     @property
     def _is_api_model(self) -> bool:
@@ -113,12 +114,20 @@ class TeCoDService(Service):
                 self.logger.info("Initializing TeCoD service...")
 
                 # Initialize all sub-services
-                services_to_init = [
-                    ("embedding", self.embedding_service),
-                    ("vector_store", self.vector_store_service),
-                    ("model", self.model_service),
-                    ("template", self.template_service),
-                ]
+                services_to_init = []
+                if self.config.tecod.icl_cnt > 0 or not self.config.tecod.skip_nli:
+                    services_to_init.extend(
+                        [
+                            ("embedding", self.embedding_service),
+                            ("vector_store", self.vector_store_service),
+                        ]
+                    )
+                services_to_init.extend(
+                    [
+                        ("model", self.model_service),
+                        ("template", self.template_service),
+                    ]
+                )
 
                 for service_name, service in services_to_init:
                     if not service.is_initialized:
@@ -150,9 +159,26 @@ class TeCoDService(Service):
                         self._schema_prompt = f.read()
 
                 # Initialize NLI model
-                with log_with_time_elapsed("Initializing NLI model", self.logger):
-                    self.logger.info("Initializing NLI model...")
-                    self._nli = NLI(model_id=self.config.nli.model, device=self.device)
+                if self.config.tecod.skip_nli:
+                    self.logger.info("Skipping NLI model initialization")
+                    self._nli = None
+                else:
+                    with log_with_time_elapsed("Initializing NLI model", self.logger):
+                        self.logger.info("Initializing NLI model...")
+                        self._nli = NLI(model_id=self.config.nli.model, device=self.device)
+
+                if self.config.tecod.use_codes_context:
+                    with log_with_time_elapsed("Initializing CodeS context builder", self.logger):
+                        from ..utils.codes_context import CodeSContextBuilder
+
+                        self._codes_context_builder = CodeSContextBuilder(
+                            root_dir=self.config.root_dir,
+                            db_path=self.config.db_path,
+                            sic_path=self.config.tecod.sic_path,
+                            top_k_tables=self.config.tecod.schema_top_k_tables,
+                            top_k_columns=self.config.tecod.schema_top_k_columns,
+                            value_retrieval=self.config.tecod.value_retrieval,
+                        )
 
                 self._mark_initialized()
                 self.logger.info("TeCoD service initialized successfully")
@@ -179,6 +205,7 @@ class TeCoDService(Service):
         self._nli = None
         self._examples_df = None
         self._schema_prompt = None
+        self._codes_context_builder = None
         self._initialized = False
 
     def _get_oracle_template(self, question, sql_query):
@@ -190,13 +217,12 @@ class TeCoDService(Service):
                 "and is not supported with API models.",
             )
 
-        from sqlglot import parse_one
-        from sqlglot.optimizer.optimize_joins import optimize_joins
-
         from ..pdec.compile_template import generate_token_ids_and_save_to_store
+        from ..pdec.tecod_utils import convert_sql_string_to_template
 
-        template = optimize_joins(parse_one(sql_query, dialect=self.config.tecod.dialect)).sql(
-            dialect=self.config.tecod.dialect
+        template = convert_sql_string_to_template(
+            sql_query,
+            db_path=str(self.config.db_file_path),
         )
 
         # check if template exists in templates
@@ -210,19 +236,18 @@ class TeCoDService(Service):
         else:
             template_id = -1
 
-        # Get ICL examples (simplified version)
-        search_results = self.vector_store_service.search(
-            question, top_k=self.config.tecod.vectorsearch_top_k
-        )
-        retrieved_examples = self.examples.iloc[search_results[0].index].copy()
-        retrieved_examples["cosine_score"] = search_results[0]["distance"].values
-
-        icl_example_indices = pick_icl_example_indices(
-            retrieved_examples, self.config.tecod.icl_cnt
-        )
-
         icl_examples = []
         if self.config.tecod.icl_cnt > 0:
+            # Get ICL examples (simplified version)
+            search_results = self.vector_store_service.search(
+                question, top_k=self.config.tecod.vectorsearch_top_k
+            )
+            retrieved_examples = self.examples.iloc[search_results[0].index].copy()
+            retrieved_examples["cosine_score"] = search_results[0]["distance"].values
+
+            icl_example_indices = pick_icl_example_indices(
+                retrieved_examples, self.config.tecod.icl_cnt
+            )
             for _, ex_row in self.examples.iloc[icl_example_indices].iterrows():
                 icl_examples.append((ex_row["text"], ex_row[self.config.tecod.sql_key]))
             icl_examples = icl_examples[::-1]
@@ -287,8 +312,23 @@ class TeCoDService(Service):
         if request.method == "auto":
             request.schema_sequence = None
             request.content_sequence = None
-            request.use_oracle = False
-            request.gold_sql = None
+            if not request.use_oracle:
+                request.gold_sql = None
+
+        prompt_query = request.query
+        if (
+            self._codes_context_builder is not None
+            and request.schema_sequence is None
+            and request.content_sequence is None
+        ):
+            evidence = request.evidence if self.config.tecod.include_evidence else None
+            schema_sequence, content_sequence, query_text = self._codes_context_builder.build(
+                request.query,
+                evidence=evidence,
+            )
+            request.schema_sequence = schema_sequence
+            request.content_sequence = content_sequence
+            prompt_query = query_text
 
         # Start overall timing
         overall_start_time = time.perf_counter()
@@ -299,7 +339,34 @@ class TeCoDService(Service):
         self.logger.info(f"Starting TeCoD generation for query: '{query_preview}'")
 
         # Template selection with detailed timing
-        if request.method != "zs":
+        if request.use_oracle and request.method != "zs":
+            icl_start = time.perf_counter()
+            if self.config.tecod.icl_cnt > 0:
+                search_results = self.vector_store_service.search(
+                    request.query, request.top_k, timing_data=timing_data
+                )
+                retrieved_examples = self._examples_df.iloc[search_results[0].index].copy()
+                retrieved_examples["cosine_score"] = search_results[0]["distance"].values
+                retrieved_examples["id"] = retrieved_examples.index
+                icl_examples, icl_example_indices = self._get_icl_examples(retrieved_examples)
+                pipeline_metrics["retrieved_examples_count"] = len(retrieved_examples)
+            else:
+                retrieved_examples = None
+                icl_examples = []
+                icl_example_indices = []
+                pipeline_metrics["retrieved_examples_count"] = 0
+            template_result = TemplateSelectionResult(
+                template_id=-1,
+                entailment_score=1.0,
+                cosine_score=1.0,
+                nli_label="oracle",
+                icl_examples=icl_examples,
+                icl_example_indices=icl_example_indices,
+                retrieved_examples=retrieved_examples,
+            )
+            template_selection_time = time.perf_counter() - icl_start
+            timing_data["template_selection_total"] = template_selection_time
+        elif request.method != "zs":
             template_start = time.perf_counter()
             template_result = self._template_selection_with_timing(
                 request.query, request.top_k, timing_data, pipeline_metrics
@@ -343,7 +410,7 @@ class TeCoDService(Service):
             prompt_class=self.config.tecod.prompt_class or None,
             schema_sequence=request.schema_sequence or self._schema_prompt,
             content_sequence=request.content_sequence or "",
-            question_text=request.query,
+            question_text=prompt_query,
             icl_examples=template_result.icl_examples if request.method != "zs" else [],
             template=template if request.method == "sgc" and has_usable_template else None,
             database_engine=self.config.tecod.dialect,
@@ -600,7 +667,10 @@ class TeCoDService(Service):
         # Process NLI results
         processing_start = time.perf_counter()
         nli_df = pd.DataFrame(nli_output)
-        nli_df["nli_label"] = nli_df.apply(lambda x: x.index[x.argmax()], axis=1)
+        for label in ("entailment", "neutral", "contradiction"):
+            if label not in nli_df:
+                nli_df[label] = 0.0
+        nli_df["nli_label"] = nli_df[["entailment", "neutral", "contradiction"]].idxmax(axis=1)
         nli_df["id"] = retrieved_examples.index
         result = nli_df.merge(retrieved_examples, how="left", left_on="id", right_index=True)
         timing_data["nli_result_processing"] = time.perf_counter() - processing_start

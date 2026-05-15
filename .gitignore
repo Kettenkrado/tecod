@@ -8,7 +8,13 @@ __pycache__/
 
 /data/
 /data_*/
+/outputs/
+/.cache/
+/tmp_bird_*/
 
 # Log files
 *.log
 *.err
+
+hf/
+sic_ckpts/

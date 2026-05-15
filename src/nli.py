@@ -131,7 +131,11 @@ class NLI:
             with torch.inference_mode():
                 outputs = self.model(**inputs)
 
-            prob = nn.Softmax(dim=-1)(outputs.logits).cpu().to(torch.float32).detach().numpy()
+            logits = outputs.logits.cpu().to(torch.float32)
+            if logits.shape[-1] == 1:
+                prob = torch.sigmoid(logits).detach().numpy()
+            else:
+                prob = nn.Softmax(dim=-1)(logits).detach().numpy()
             # Softmax on very large negative logits can produce NaN in mixed
             # precision. Replace with zeros so downstream consumers don't
             # propagate garbage probabilities.
@@ -139,14 +143,55 @@ class NLI:
 
             prob = np.nan_to_num(prob, nan=0.0, posinf=1.0, neginf=0.0)
 
-            batch_prob_dict: list[dict[str, float]] = [
-                {
-                    label: float(prob[j][l_idx])
-                    for l_idx, label in self.model.config.id2label.items()
-                }
-                for j in range(prob.shape[0])
-            ]
+            if prob.shape[-1] == 1:
+                batch_prob_dict = [
+                    {
+                        "entailment": float(prob[j][0]),
+                        "neutral": float(1.0 - prob[j][0]),
+                        "contradiction": 0.0,
+                    }
+                    for j in range(prob.shape[0])
+                ]
+            else:
+                batch_prob_dict: list[dict[str, float]] = [
+                    self._normalise_label_scores(
+                        {
+                            label: float(prob[j][l_idx])
+                            for l_idx, label in self.model.config.id2label.items()
+                        }
+                    )
+                    for j in range(prob.shape[0])
+                ]
 
             all_prob_dicts.extend(batch_prob_dict)
 
         return all_prob_dicts
+
+    @staticmethod
+    def _normalise_label_scores(scores: dict[str, float]) -> dict[str, float]:
+        """Map common classifier label names to TeCoD's NLI label contract."""
+        lowered = {str(label).lower(): value for label, value in scores.items()}
+        normalised = {
+            "entailment": 0.0,
+            "neutral": 0.0,
+            "contradiction": 0.0,
+        }
+
+        for label, value in lowered.items():
+            if label in normalised:
+                normalised[label] = value
+            elif "entail" in label or label in {"positive", "relevant", "label_1"}:
+                normalised["entailment"] = value
+            elif "contra" in label or label in {"negative", "irrelevant", "label_0"}:
+                normalised["contradiction"] = value
+            elif "neutral" in label or label == "label_2":
+                normalised["neutral"] = value
+
+        if sum(normalised.values()) == 0.0 and scores:
+            best_label, best_value = max(scores.items(), key=lambda item: item[1])
+            if str(best_label).lower() == "label_0":
+                normalised["entailment"] = best_value
+            else:
+                normalised["neutral"] = best_value
+
+        return normalised
